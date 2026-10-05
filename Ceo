@@ -1,0 +1,561 @@
+import asyncio
+import enum
+import hashlib
+import inspect
+import json
+import logging
+import math
+import random
+from collections import OrderedDict
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Union,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("CEOAgent")
+
+
+class PermissionLevel(str, enum.Enum):
+    LEVEL_1_AUTONOMOUS = "LEVEL_1_AUTONOMOUS"
+    LEVEL_2_CONDITIONAL = "LEVEL_2_CONDITIONAL"
+    LEVEL_3_RESTRICTED = "LEVEL_3_RESTRICTED"
+
+
+class ApprovalDecision(str, enum.Enum):
+    NOT_REQUIRED = "NOT_REQUIRED"
+    APPROVED = "APPROVED"
+    DENIED = "DENIED"
+    PENDING = "PENDING"
+    UNAVAILABLE = "UNAVAILABLE"
+    PROHIBITED = "PROHIBITED"
+
+
+class Domain(str, enum.Enum):
+    FINANCIAL = "FINANCIAL"
+    STAFFING = "STAFFING"
+    OPERATIONS = "OPERATIONS"
+    LEGAL = "LEGAL"
+    COMMUNICATIONS = "COMMUNICATIONS"
+
+
+@dataclass(frozen=True)
+class ActionRequest:
+    action_id: str
+    domain: Domain
+    action_type: str
+    parameters: Dict[str, Any]
+    timestamp: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+
+@dataclass(frozen=True)
+class AgentResponse:
+    action_id: str
+    permission_level: PermissionLevel
+    approval_decision: ApprovalDecision
+    status: str
+    payload: Dict[str, Any]
+    requires_human_approval: bool
+    audit_notes: str
+
+
+ApprovalWebhook = Union[
+    Callable[[Dict[str, Any]], bool],
+    Callable[[Dict[str, Any]], Awaitable[bool]],
+]
+
+
+class ApprovalWebhookError(Exception):
+    """Base exception for approval webhook failures."""
+
+
+class ApprovalWebhookTimeout(ApprovalWebhookError):
+    """Raised when all approval attempts time out."""
+
+
+class ApprovalWebhookUnavailable(ApprovalWebhookError):
+    """Raised when retryable webhook failures are exhausted."""
+
+
+class InvalidApprovalResponse(ApprovalWebhookError):
+    """Raised when the webhook violates its response contract."""
+
+
+class ActionIdConflictError(Exception):
+    """Raised when an action ID is reused with different content."""
+
+
+class BoundedOrderedDict(OrderedDict):
+    """Thread-safe bounded dictionary to prevent unbounded in-memory expansion."""
+    def __init__(self, maxsize: int = 10000, *args, **kwargs):
+        self.maxsize = maxsize
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            self.popitem(last=False)
+
+
+class CEOAgent:
+    """
+    Policy-enforcement agent with fail-closed approvals.
+
+    Key Guarantees:
+    - Autonomous actions are authorized only after strict policy validation.
+    - Conditional actions require an explicit boolean True from webhook.
+    - False is a final denial and is not retried.
+    - Missing webhooks, timeouts, exceptions, and malformed responses fail closed.
+    - Restricted and unknown actions are blocked.
+    - All attempts for one operation share the same idempotency key.
+    - Concurrent identical requests share one in-flight processing task.
+    - Reusing an action ID with different request content is blocked (blocked_conflict).
+    - In-memory data structures are bounded to prevent memory leaks.
+    """
+
+    FINAL_STATUSES: Set[str] = {
+        "approved",
+        "denied",
+        "blocked",
+        "authorized",
+        "blocked_conflict",
+    }
+
+    def __init__(
+        self,
+        approval_webhook: Optional[ApprovalWebhook] = None,
+        approval_timeout_seconds: float = 5.0,
+        approval_max_attempts: int = 3,
+        approval_retry_base_delay_seconds: float = 0.5,
+        approval_retry_max_delay_seconds: float = 4.0,
+        max_cache_entries: int = 10000,
+    ):
+        self._validate_configuration(
+            approval_timeout_seconds=approval_timeout_seconds,
+            approval_max_attempts=approval_max_attempts,
+            approval_retry_base_delay_seconds=approval_retry_base_delay_seconds,
+            approval_retry_max_delay_seconds=approval_retry_max_delay_seconds,
+        )
+
+        self.approval_webhook = approval_webhook
+        self.approval_timeout_seconds = float(approval_timeout_seconds)
+        self.approval_max_attempts = int(approval_max_attempts)
+        self.approval_retry_base_delay_seconds = float(approval_retry_base_delay_seconds)
+        self.approval_retry_max_delay_seconds = float(approval_retry_max_delay_seconds)
+
+        self.audit_log: List[AgentResponse] = []
+
+        # Shared request-processing state protection
+        self._state_lock = asyncio.Lock()
+
+        # Deduplication task map
+        self._inflight_requests: Dict[str, asyncio.Task[AgentResponse]] = {}
+
+        # Bounded state registries
+        self._completed_responses = BoundedOrderedDict(maxsize=max_cache_entries)
+        self._action_fingerprints = BoundedOrderedDict(maxsize=max_cache_entries)
+
+        self.rules = {
+            "financial": {
+                "autonomous": {
+                    "generate_daily_expense_reports",
+                    "generate_weekly_expense_reports",
+                    "flag_invoice_discrepancies",
+                    "flag_cash_flow_anomalies",
+                    "reconcile_logged_operational_receipts",
+                },
+                "conditional": {
+                    "draft_vendor_payout_schedules",
+                    "prepare_operational_budgets",
+                    "propose_scope_change_fees",
+                    "propose_rate_increases",
+                },
+                "restricted": {
+                    "approve_wire_transfers",
+                    "approve_bank_payouts",
+                    "open_credit_lines",
+                    "close_credit_lines",
+                    "open_merchant_accounts",
+                    "close_merchant_accounts",
+                    "modify_core_pricing_models",
+                },
+                "amount_caps": {
+                    "reconcile_logged_operational_receipts": 250.00,
+                },
+            },
+            "staffing": {
+                "autonomous": {
+                    "screen_applications",
+                    "auto_schedule_interviews",
+                    "send_onboarding_materials",
+                    "send_onboarding_checklists",
+                },
+                "conditional": {
+                    "draft_disciplinary_notices",
+                    "draft_warnings",
+                    "prepare_compensation_adjustments",
+                    "compile_performance_review_scorecards",
+                },
+                "restricted": {
+                    "final_hiring_decisions",
+                    "issue_termination_notices",
+                    "issue_severance_agreements",
+                    "modify_payroll",
+                    "modify_tax_withholding",
+                    "modify_benefits",
+                    "sign_offer_letters",
+                    "terminate_employee",
+                },
+                "amount_caps": {},
+            },
+            "operations": {
+                "autonomous": {
+                    "assign_daily_task_routes",
+                    "assign_work_orders",
+                    "trigger_inventory_reorders",
+                    "log_quality_audit_scores",
+                },
+                "conditional": {
+                    "update_sops",
+                    "reassign_service_territory_routes",
+                    "reschedule_client_delivery_milestones",
+                },
+                "restricted": {
+                    "alter_safety_protocols",
+                    "alter_regulatory_compliance_protocols",
+                    "waive_service_liabilities",
+                    "waive_warranty_terms",
+                    "suspend_client_operations",
+                },
+                "amount_caps": {
+                    "trigger_inventory_reorders": 1500.00,
+                },
+            },
+            "legal": {
+                "autonomous": set(),
+                "conditional": set(),
+                "restricted": {
+                    "provide_legal_advice",
+                    "file_legal_claims",
+                    "settle_legal_claims",
+                    "waive_legal_rights",
+                    "accept_legal_liability",
+                    "sign_legal_filings",
+                    "retain_legal_counsel",
+                    "terminate_legal_counsel",
+                },
+                "amount_caps": {},
+            },
+            "communications": {
+                "autonomous": {
+                    "send_transactional_confirmations",
+                    "log_routine_inquiries",
+                    "deliver_preapproved_operational_updates",
+                },
+                "conditional": {
+                    "draft_business_proposals",
+                    "draft_rfps",
+                    "formulate_responses_to_client_disputes",
+                    "write_subcontractor_agreements",
+                },
+                "restricted": {
+                    "sign_contracts",
+                    "sign_leases",
+                    "communicate_with_legal_counsel",
+                    "communicate_with_insurers",
+                    "authorize_nda_waivers",
+                    "authorize_non_compete_waivers",
+                },
+                "amount_caps": {},
+            },
+        }
+
+    @staticmethod
+    def _validate_configuration(
+        approval_timeout_seconds: float,
+        approval_max_attempts: int,
+        approval_retry_base_delay_seconds: float,
+        approval_retry_max_delay_seconds: float,
+    ) -> None:
+        if approval_timeout_seconds <= 0:
+            raise ValueError("approval_timeout_seconds must be greater than zero.")
+        if approval_max_attempts <= 0:
+            raise ValueError("approval_max_attempts must be greater than zero.")
+        if approval_retry_base_delay_seconds < 0:
+            raise ValueError("approval_retry_base_delay_seconds cannot be negative.")
+        if approval_retry_max_delay_seconds < 0:
+            raise ValueError("approval_retry_max_delay_seconds cannot be negative.")
+        if approval_retry_max_delay_seconds < approval_retry_base_delay_seconds:
+            raise ValueError(
+                "approval_retry_max_delay_seconds cannot be less than base delay."
+            )
+
+    @staticmethod
+    def _is_valid_capped_amount(amount: Any, cap: float) -> bool:
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            return False
+        if math.isnan(amount) or math.isinf(amount) or amount < 0:
+            return False
+        return amount <= cap
+
+    @staticmethod
+    def _fingerprint_request(request: ActionRequest) -> str:
+        """Deterministic canonical JSON serialization for idempotent hashing."""
+        data = {
+            "domain": request.domain.value,
+            "action_type": request.action_type,
+            "parameters": request.parameters,
+        }
+        serialized = json.dumps(data, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def evaluate_permission(self, request: ActionRequest) -> PermissionLevel:
+        domain_key = request.domain.value.lower()
+        if domain_key not in self.rules:
+            return PermissionLevel.LEVEL_3_RESTRICTED
+
+        domain_config = self.rules[domain_key]
+        action = request.action_type
+
+        # 1. Level 3: Restricted Actions
+        if action in domain_config.get("restricted", set()):
+            return PermissionLevel.LEVEL_3_RESTRICTED
+
+        # 2. Capped Financial / Operational Actions
+        amount_caps = domain_config.get("amount_caps", {})
+        if action in amount_caps:
+            cap = amount_caps[action]
+            amount = (
+                request.parameters.get("amount")
+                if isinstance(request.parameters, dict)
+                else None
+            )
+            if self._is_valid_capped_amount(amount, cap):
+                return PermissionLevel.LEVEL_1_AUTONOMOUS
+            return PermissionLevel.LEVEL_2_CONDITIONAL
+
+        # 3. Level 1: Autonomous Actions
+        if action in domain_config.get("autonomous", set()):
+            return PermissionLevel.LEVEL_1_AUTONOMOUS
+
+        # 4. Level 2: Conditional Actions
+        if action in domain_config.get("conditional", set()):
+            return PermissionLevel.LEVEL_2_CONDITIONAL
+
+        # 5. Fail-Closed Default
+        return PermissionLevel.LEVEL_3_RESTRICTED
+
+    async def _execute_webhook_with_retry(
+        self,
+        request: ActionRequest,
+        idempotency_key: str,
+    ) -> ApprovalDecision:
+        if self.approval_webhook is None:
+            return ApprovalDecision.UNAVAILABLE
+
+        payload = {
+            "idempotency_key": idempotency_key,
+            "action_id": request.action_id,
+            "domain": request.domain.value,
+            "action_type": request.action_type,
+            "parameters": deepcopy(request.parameters),
+            "timestamp": request.timestamp.isoformat(),
+        }
+
+        delay = self.approval_retry_base_delay_seconds
+
+        for attempt in range(1, self.approval_max_attempts + 1):
+            try:
+                if inspect.iscoroutinefunction(self.approval_webhook):
+                    coro = self.approval_webhook(payload)
+                else:
+                    coro = asyncio.to_thread(self.approval_webhook, payload)
+
+                result = await asyncio.wait_for(
+                    coro,
+                    timeout=self.approval_timeout_seconds,
+                )
+
+                # Strict type contract: must be boolean
+                if not isinstance(result, bool):
+                    logger.warning(
+                        "Webhook returned non-boolean value '%s'. Violates contract.",
+                        result,
+                    )
+                    return ApprovalDecision.DENIED
+
+                # False is a final denial and not retried
+                if result is True:
+                    return ApprovalDecision.APPROVED
+                return ApprovalDecision.DENIED
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Approval attempt %d/%d timed out after %.2fs",
+                    attempt,
+                    self.approval_max_attempts,
+                    self.approval_timeout_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Approval attempt %d/%d encountered error: %s",
+                    attempt,
+                    self.approval_max_attempts,
+                    exc,
+                )
+
+            if attempt < self.approval_max_attempts:
+                sleep_time = random.uniform(0, min(delay, self.approval_retry_max_delay_seconds))
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                delay = min(delay * 2, self.approval_retry_max_delay_seconds)
+
+        return ApprovalDecision.UNAVAILABLE
+
+    async def process_request(self, request: ActionRequest) -> AgentResponse:
+        # String validation
+        if (
+            not request.action_id
+            or not request.action_id.strip()
+            or not request.action_type
+            or not request.action_type.strip()
+        ):
+            blocked_response = AgentResponse(
+                action_id=request.action_id,
+                permission_level=PermissionLevel.LEVEL_3_RESTRICTED,
+                approval_decision=ApprovalDecision.PROHIBITED,
+                status="blocked",
+                payload={"error": "action_id and action_type must be non-empty strings."},
+                requires_human_approval=False,
+                audit_notes="Blocked at validation: missing or whitespace-only identifier.",
+            )
+            self.audit_log.append(blocked_response)
+            return blocked_response
+
+        current_fingerprint = self._fingerprint_request(request)
+
+        async with self._state_lock:
+            # Enforce action ID payload immutability
+            existing_fingerprint = self._action_fingerprints.get(request.action_id)
+            if existing_fingerprint and existing_fingerprint != current_fingerprint:
+                conflict_response = AgentResponse(
+                    action_id=request.action_id,
+                    permission_level=PermissionLevel.LEVEL_3_RESTRICTED,
+                    approval_decision=ApprovalDecision.PROHIBITED,
+                    status="blocked_conflict",
+                    payload={
+                        "error": "Action ID reused with differing payload content.",
+                        "action_id": request.action_id,
+                    },
+                    requires_human_approval=False,
+                    audit_notes="Blocked ID conflict: attempted reuse of existing action_id with altered fingerprint.",
+                )
+                self.audit_log.append(conflict_response)
+                return conflict_response
+
+            self._action_fingerprints[request.action_id] = current_fingerprint
+
+            if current_fingerprint in self._completed_responses:
+                return self._completed_responses[current_fingerprint]
+
+            if current_fingerprint in self._inflight_requests:
+                task = self._inflight_requests[current_fingerprint]
+            else:
+                task = asyncio.create_task(
+                    self._process_request_internal(request, current_fingerprint)
+                )
+                self._inflight_requests[current_fingerprint] = task
+
+        try:
+            return await task
+        finally:
+            async with self._state_lock:
+                self._inflight_requests.pop(current_fingerprint, None)
+
+    async def _process_request_internal(
+        self,
+        request: ActionRequest,
+        idempotency_key: str,
+    ) -> AgentResponse:
+        level = self.evaluate_permission(request)
+
+        # Level 1: Autonomous Execution
+        if level == PermissionLevel.LEVEL_1_AUTONOMOUS:
+            response = AgentResponse(
+                action_id=request.action_id,
+                permission_level=level,
+                approval_decision=ApprovalDecision.NOT_REQUIRED,
+                status="authorized",
+                payload={
+                    "domain": request.domain.value,
+                    "action_type": request.action_type,
+                    "parameters": deepcopy(request.parameters),
+                },
+                requires_human_approval=False,
+                audit_notes="Autonomous execution authorized within validated policy limits.",
+            )
+
+        # Level 3: Hard Restricted Block
+        elif level == PermissionLevel.LEVEL_3_RESTRICTED:
+            response = AgentResponse(
+                action_id=request.action_id,
+                permission_level=level,
+                approval_decision=ApprovalDecision.PROHIBITED,
+                status="blocked",
+                payload={"error": f"Action '{request.action_type}' is restricted or unregistered."},
+                requires_human_approval=False,
+                audit_notes="Blocked under Level 3 boundary rules.",
+            )
+
+        # Level 2: Conditional Approval Required
+        else:
+            decision = await self._execute_webhook_with_retry(request, idempotency_key)
+
+            if decision == ApprovalDecision.APPROVED:
+                status = "approved"
+                requires_human = False
+                audit_notes = "Conditional authorization granted via human approval webhook."
+            elif decision == ApprovalDecision.DENIED:
+                status = "denied"
+                requires_human = True
+                audit_notes = "Conditional action denied by human operator."
+            else:
+                status = "blocked"
+                requires_human = True
+                audit_notes = (
+                    f"Conditional action failed closed due to approval unavailability: {decision.value}."
+                )
+
+            response = AgentResponse(
+                action_id=request.action_id,
+                permission_level=level,
+                approval_decision=decision,
+                status=status,
+                payload={
+                    "domain": request.domain.value,
+                    "action_type": request.action_type,
+                    "parameters": deepcopy(request.parameters),
+                },
+                requires_human_approval=requires_human,
+                audit_notes=audit_notes,
+            )
+
+        async with self._state_lock:
+            self._completed_responses[idempotency_key] = response
+            self.audit_log.append(response)
+
+        return response
